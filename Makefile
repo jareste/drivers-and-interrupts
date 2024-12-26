@@ -10,7 +10,7 @@ install:
 	sudo insmod srcs/keyboard_logger.ko
 
 uninstall:
-	sudo rmmod srcs/keyboard_logger
+	sudo rmmod keyboard_logger
 
 
 .gitignore:
@@ -22,9 +22,12 @@ uninstall:
 		echo "Makefile" >> .gitignore; \
 		echo "srcs/*" >> .gitignore; \
 		echo "!srcs/keyboard_logger.c" >> .gitignore; \
+		echo "!srcs/show_logs.py" >> .gitignore; \
 		echo "!.git" >> .gitignore; \
 		echo ".gitignore created and updated with entries."; \
 	else \
 		echo ".gitignore already exists."; \
 	fi
 
+show:
+	sudo tail -f /dev/module_keyboard
