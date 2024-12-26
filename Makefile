@@ -30,4 +30,4 @@ uninstall:
 	fi
 
 show:
-	sudo tail -f /dev/module_keyboard
+	sudo tail -f /dev/jareste_keylogger
